@@ -1,4 +1,5 @@
 # Import modules and libraries
+import imp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +8,7 @@ from torch.nn.functional import interpolate
 from lib.solvers import anderson, broyden, normal
 from lib.jacobian import jac_loss_estimate
 import math
+import numpy as np
 
 ###############################################
 ## blocks for all network
@@ -48,18 +50,23 @@ class ResConv2DLeakyReLUBN(nn.Module):
 
 
 class ResNetLayer(nn.Module):
-    def __init__(self, n_channels, n_inner_channels, kernel_size=3, num_groups=8):
+    def __init__(self, n_channels, n_inner_channels, kernel_size=3, num_groups=4):
         super().__init__()
         self.conv1 = nn.Conv2d(n_channels, n_inner_channels, kernel_size, padding=kernel_size//2, bias=False)
+        self.conv3 = nn.Conv2d(n_inner_channels, n_inner_channels * 2, kernel_size, padding=kernel_size//2, bias=False)
+        self.conv4 = nn.Conv2d(n_inner_channels * 2, n_inner_channels, kernel_size, padding=kernel_size//2, bias=False)
         self.conv2 = nn.Conv2d(n_inner_channels, n_channels, kernel_size, padding=kernel_size//2, bias=False)
         self.norm1 = nn.GroupNorm(num_groups, n_inner_channels)
-        self.norm2 = nn.GroupNorm(n_channels, n_channels)
-        self.norm3 = nn.GroupNorm(n_channels, n_channels)
+        self.norm2 = nn.GroupNorm(num_groups, n_channels)
+        self.norm3 = nn.GroupNorm(num_groups, n_channels)
+        self.norm4 = nn.GroupNorm(num_groups, n_inner_channels)
+        self.norm5 = nn.GroupNorm(num_groups, n_inner_channels * 2)
         self.conv1.weight.data.normal_(0, 0.01)
         self.conv2.weight.data.normal_(0, 0.01)
         
     def forward(self, z, x):
         y = self.norm1(F.relu(self.conv1(z)))
+        y = self.norm4(F.relu(self.conv4(self.norm5(F.relu(self.conv3(y))))))
         return self.norm3(F.relu(z + self.norm2(x + self.conv2(y))))
 
 
@@ -92,6 +99,8 @@ class ResLocalizationCNN(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, im):  # [4,1,96,96]
+
+        im = im.view(self.opt.batch_size, -1, self.opt.H, self.opt.W)
 
         # extract multi-scale features
         im = self.norm(im) # [4,1,96,96]
@@ -183,124 +192,81 @@ class LocalizationCNN(nn.Module):
         return out
 
 
-# COAST unrolling network
-class CPMB(nn.Module):
-    '''Residual block with scale control
-    ---Conv-ReLU-Conv-+-
-     |________________|
-    '''
-
-    def __init__(self, res_scale_linear, nf=32):
-        super(CPMB, self).__init__()
-
-        conv_bias = True
-        # scale_bias = True
-        # cond_dim = 2
-
-        self.conv1 = nn.Conv2d(nf, nf, 3, 1, 1, bias=conv_bias)
-        self.conv2 = nn.Conv2d(nf, nf, 3, 1, 1, bias=conv_bias)
-        self.res_scale = res_scale_linear
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        cond = x[1]
-        content = x[0]
-        cond = cond[:, 0:1]
-        cond_repeat = cond.repeat((content.shape[0], 1))
-        out = self.act(self.conv1(content))
-        out = self.conv2(out)
-        res_scale = self.res_scale(cond_repeat)
-        alpha1 = res_scale.view(-1, 32, 1, 1)
-        out1 = out * alpha1
-        return content + out1, cond
-    
-
-class BasicBlock(nn.Module):
-    def __init__(self, res_scale_linear):
-        super(BasicBlock, self).__init__()
-
-        self.lambda_step = nn.Parameter(torch.Tensor([0.5]))
-
-        self.head_conv = nn.Conv2d(1, 32, 3, 1, 1, bias=True)
-        self.ResidualBlocks = nn.Sequential(
-            CPMB(res_scale_linear=res_scale_linear, nf=32),
-            CPMB(res_scale_linear=res_scale_linear, nf=32),
-            CPMB(res_scale_linear=res_scale_linear, nf=32)
-        )
-        self.tail_conv = nn.Conv2d(32, 1, 3, 1, 1, bias=True)
-
-    def forward(self, x, PhiTb, cond, block_size):
-        x = x - self.lambda_step * x
-        x = x + self.lambda_step * PhiTb
-        x_input = x.view(-1, 1, block_size, block_size)
-
-        x_mid = self.head_conv(x_input)
-        x_mid, cond = self.ResidualBlocks([x_mid, cond])
-        x_mid = self.tail_conv(x_mid)
-        x_pred = x_input + x_mid
-
-        x_pred = x_pred.view(-1, block_size * block_size)
-
-        return x_pred
-    
-
-class COAST(nn.Module):
-    def __init__(self, LayerNo = 20, nf = 32):
-        super(COAST, self).__init__()
-        onelayer = []
-        self.LayerNo = LayerNo
-        scale_bias = True
-        res_scale_linear = nn.Linear(1, nf, bias=scale_bias)
-
-        for i in range(LayerNo):
-            onelayer.append(BasicBlock(res_scale_linear=res_scale_linear))
-
-        self.fcs = nn.ModuleList(onelayer)
-
-    def forward(self, x, block_size=96):
-
-        I = torch.eye(x.shape, dtype=x.dtype, device=x.device).detach()
-        cond = torch.tensor((1, 0.5))
-
-        PhiTb = x.clone()
-
-        for i in range(self.LayerNo):
-            x = self.fcs[i](x, I, PhiTb, cond, block_size)
-
-        x_final = x
-
-        return x_final
-
-
-class COASTModel(nn.Module):
+class DnCNN(nn.Module):
     def __init__(self, opt):
-        super(COASTModel, self).__init__()
+        super(DnCNN, self).__init__()
         self.opt = opt
-        self.coast = COAST()
-        self.layer1 = Conv2DLeakyReLUBN(1, 64, 3, 1, 1, 0.2)
-        self.layer2 = Conv2DLeakyReLUBN(64, opt.D, 3, 1, 1, 0.2)
-        self.layer3 = ResConv2DLeakyReLUBN(opt.D, opt.D, 3, 1, 1, 0.2)
-        self.layer4 = nn.Conv2d(opt.D, opt.D, kernel_size=1, dilation=1)
-        self.pred = nn.Hardtanh(min_val=0.0, max_val=opt.scaling_factor)
-        self.dropout = nn.Dropout(p=0.5)
+        self.conv1 = nn.Conv2d(1, 64, 3, padding=1)
+        self.convBnRelu1 = Conv2DLeakyReLUBN(64, 64, 3, 1, 1, 0.2)
+        self.convBnRelu2 = Conv2DLeakyReLUBN(64, 64, 3, 2, 2, 0.2)
+        self.convBnRelu3 = Conv2DLeakyReLUBN(64, 64, 3, 4, 4, 0.2)
+        self.convBnRelu4 = Conv2DLeakyReLUBN(64, 64, 3, 8, 8, 0.2)
+        self.convBnRelu5 = Conv2DLeakyReLUBN(64, 64, 3, 16, 16, 0.2)
+        self.conv2 = nn.Conv2d(64, 1, 3, padding=1)
+
 
     def forward(self, im):
-        out = self.coast(im)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-
-        if self.opt.upsampling_factor == 2:
-            # upsample by 2 in xy
-            out = interpolate(out, scale_factor=2)
-        elif self.opt.upsampling_factor == 4:
-            out = interpolate(out, scale_factor=4)
-
-        out = self.dropout(out)
-        out = self.layer4(out)
-        out = self.pred(out)
+        out = F.relu(self.conv1(im))
+        out = self.convBnRelu1(out)
+        out = self.convBnRelu2(out)
+        out = self.convBnRelu3(out)
+        out = self.convBnRelu4(out)
+        out = self.convBnRelu5(out)
+        out = F.relu(self.conv2(out))
         return out
+
+
+class AT_GT(nn.Module):
+    def __init__(self, opt):
+        super(AT_GT, self).__init__()
+        self.opt = opt
     
+    def AnscombeTransform(self, input):
+        return 2 * (input + 0.375)**0.5
+
+    def inverse_AnscombeTransform(self, input):
+        return 0.25 * input**2 + 0.25 * 1.5**0.5 * input**(-1) - 11 / 8 * input**(-2) + 0.625 * 1.5**0.5 * input**(-3) - 0.125
+
+    def gaussian_filter(self, img, K_size=3, sigma=1.3):
+        if len(img.shape) == 3:
+            H, W, C = img.shape
+        else:
+            img = np.expand_dims(img, axis=-1)
+            H, W, C = img.shape
+    
+        img = img.numpy()
+        pad = K_size // 2
+        out = np.zeros((H + pad * 2, W + pad * 2, C), dtype=np.float)
+        out[pad: pad + H, pad: pad + W] = img.copy().astype(np.float)
+    
+        K = np.zeros((K_size, K_size), dtype=np.float)
+        for x in range(-pad, -pad + K_size):
+            for y in range(-pad, -pad + K_size):
+                K[y + pad, x + pad] = np.exp( -(x ** 2 + y ** 2) / (2 * (sigma ** 2)))
+    
+        K /= (2 * np.pi * sigma * sigma)
+        K /= K.sum()
+        tmp = out.copy()
+    
+        for y in range(H):
+            for x in range(W):
+                for c in range(C):
+                    out[pad + y, pad + x, c] = np.sum(K * tmp[y: y + K_size, x: x + K_size, c])
+    
+        out = np.clip(out, 0, 255)
+        out = out[pad: pad + H, pad: pad + W].astype(np.float32)
+        return out
+
+    def forward(self, im):
+        im = torch.squeeze(im, 0)
+        at_im = self.AnscombeTransform(im)
+        at_im = at_im.to('cpu')
+        at_im = self.gaussian_filter(at_im)
+        at_im = torch.tensor(at_im)
+        at_im = at_im.to('cuda')
+        out = self.inverse_AnscombeTransform(at_im)
+        return out
+
     
 class DEQFixedPoint(nn.Module):
     def __init__(self, opt, f, solver):

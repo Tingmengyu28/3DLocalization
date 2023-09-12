@@ -7,18 +7,21 @@ from collections import defaultdict
 import csv
 import torch
 import torch.distributed as dist
+import pandas as pd
 # self-defined modules
 from utils.loss import calculate_loss
 from utils.data import dataloader
 from utils.postprocess import Postprocess
-from utils.helper import print_log, load_labels, print_time
+from utils.helper import print_log, load_labels, print_time, get_precision_recall
+from scipy.io import savemat
+
 
 
 def test_model(opt, model, log=None):
 
     imgs_path = opt.data_path
-    save_path = opt.save_path + '/step' + opt.step_mode
-    checkpoint_path = './Data/results/step' + opt.step_mode + opt.checkpoint_path + '/' + opt.checkpoint
+    save_path = opt.save_path + '/step' + opt.step_mode + '/' + opt.model_use_denoising
+    checkpoint_path = './Data/results/step' + opt.step_mode + '/' + opt.model_use_denoising + opt.checkpoint_path + '/' + opt.checkpoint
 
     # copy setup params of train model into infer save folder
     path_train_result = os.path.dirname(checkpoint_path)
@@ -30,7 +33,7 @@ def test_model(opt, model, log=None):
             if not key == 'partition':
                 print_log('{}: {}'.format(key,value),log)
 
-    device= 'cuda'
+    device = 'cuda'
     calc_loss = calculate_loss(opt)
 
     try:
@@ -56,7 +59,6 @@ def test_model(opt, model, log=None):
 
         params_test = {'batch_size': 1, 'shuffle': False, 'partition':img_names}
         data_generator = dataloader(imgs_path, labels, params_test, opt)
-
     postpro_module = Postprocess(opt)
 
     # time the entire dataset analysis
@@ -64,11 +66,25 @@ def test_model(opt, model, log=None):
 
     # process all experimental images
     model.eval()
-    if opt.step_mode == 'all':
+    if opt.step_mode == 'all' or opt.step_mode == '2':
         metric = defaultdict(float)
         results = np.array(['frame', 'x', 'y', 'z', 'intensity'])
         results_bol = np.array(['frame', 'x', 'y', 'z', 'intensity'])
         pt = open(os.path.join(save_path, 'test_results','loss_{}.txt'.format(opt.rank)),'w')
+
+        gt_points, precision_dict, recall_dict = {}, {}, {}
+        with open(os.path.join(opt.data_path, 'observed', 'label.txt'), 'r') as f:
+            for id_gt in f.readlines():
+                id_gt = id_gt.strip('\n')
+                str_list = id_gt.split(' ')
+                if int(str_list[0]) in gt_points.keys():
+                    gt_points[int(str_list[0])].append((float(str_list[1]), float(str_list[2]), float(str_list[3])))
+                else:
+                    gt_points[int(str_list[0])] = [(float(str_list[1]), float(str_list[2]), float(str_list[3]))]
+
+        for i in range(5, 46):
+            precision_dict[i], recall_dict[i] = [], []
+
         with torch.set_grad_enabled(False):
             for im_ind, (im_tensor, target, target_2d, fileid) in enumerate(data_generator):
                 
@@ -83,8 +99,9 @@ def test_model(opt, model, log=None):
                 # post-process result to get the xyz coordinates and their confidence
                 xyz_rec, conf_rec, xyz_bool = postpro_module(pred_volume)
 
-                # if prediction is empty then set number for found emitters to 0
-                # otherwise generate the frame column and append results for saving
+                # import pdb
+                # pdb.set_trace()
+
                 if xyz_rec is None:
                     nemitters = 0
                 else:
@@ -99,6 +116,30 @@ def test_model(opt, model, log=None):
                         print_log('Test sample {} Img{} found {:d}/{} emitters'.format(im_ind, fileid[0],nemitters,len(xyz_gt)),log)
                     else:
                         print_log('Test sample {} Img{} found {:d} emitters'.format(im_ind, fileid[0], nemitters),log)
+
+                gt_points_loc = gt_points[int(fileid[0])]
+                
+                precision, recall = get_precision_recall(gt_points_loc, xyz_rec)
+                if len(gt_points[int(fileid[0])]) in precision_dict.keys():
+                    precision_dict[len(gt_points[int(fileid[0])])].append(precision)
+                    recall_dict[len(gt_points[int(fileid[0])])].append(recall)
+
+        avg_precision, avg_recall, result_dict = {}, {}, {}
+        for k, v in precision_dict.items():
+            if len(v) != 0:
+                avg_precision[k] = np.mean(v)
+        for k, v in recall_dict.items():
+            if len(v) != 0:
+                avg_recall[k] = np.mean(v)
+
+        result_dict['num_points'], result_dict['precision'], result_dict['recall'] = [], [], []
+        for k in avg_precision.keys():
+            result_dict['num_points'].append(k)
+            result_dict['precision'].append(avg_precision[k])
+            result_dict['recall'].append(avg_recall[k])
+        
+        result_df = pd.DataFrame(result_dict)
+        result_df.to_csv(os.path.join(save_path, 'test_results','precision_recall.csv'))
 
         # print the time it took for the entire analysis
         tall_end = time.time() - tall_start
@@ -148,19 +189,42 @@ def test_model(opt, model, log=None):
         with torch.set_grad_enabled(False):
             for im_ind, (im_tensor, target, target_2d, fileid) in enumerate(data_generator):
                 
-                im_tensor = im_tensor.to(device)
-                target = target.to(device)
-                target_2d = target_2d.to(device)
+                if opt.model_use == 'deq':
+                    im_tensor = im_tensor.to(device)
+                    target_2d = target_2d.to(device)
 
-                pred_im = model(im_tensor)
-                mseloss = torch.nn.MSELoss(pred_im, target_2d)
+                    pred_im = model(im_tensor)
+                    critierion = torch.nn.MSELoss()
+                    
+                    target_2d = torch.squeeze(target_2d, 1)
+                    mseloss = critierion(pred_im, target_2d)
 
-                print_log('Test sample {} Img{} complete, MSELoss is {:.4f}'.format(im_ind, fileid[0], mseloss))
+                    pred_im_cpu = pred_im.cpu()
+                    pred_im_cpu = np.array(pred_im_cpu)
+                    savemat(os.path.join(imgs_path, 'denoised_' + opt.model_use, 'denoised_image_{}.mat'.format(fileid[0])), {'im': pred_im_cpu})
+
+                    print_log('Test sample {} Img{} complete, MSELoss is {:.4f}'.format(im_ind, fileid[0], mseloss), log)
+
+                elif opt.model_use == 'dncnn':
+                    im_tensor = im_tensor.to(device)
+                    target_2d = target_2d.to(device)
+
+                    residual_im = model(im_tensor)
+                    critierion = torch.nn.MSELoss()
+                    
+                    target_2d = torch.squeeze(target_2d, 1)
+                    pred_im = im_tensor - residual_im
+                    mseloss = critierion(pred_im, target_2d)
+
+                    pred_im_cpu = pred_im.cpu()
+                    pred_im_cpu = np.array(pred_im_cpu)
+                    savemat(os.path.join(imgs_path, 'denoised_' + opt.model_use, 'denoised_image_{}.mat'.format(fileid[0])), {'im': pred_im_cpu})
+
+                    print_log('Test sample {} Img{} complete, MSELoss is {:.4f}'.format(im_ind, fileid[0], mseloss), log)
 
         tall_end = time.time() - tall_start
         if opt.rank==0:
             print_log('=' * 50,log, arrow=False)
             print_log('Analysis complete in {}'.format(print_time(tall_end)), log)
             print_log('=' * 50,log, arrow=False)
-
         return pred_im

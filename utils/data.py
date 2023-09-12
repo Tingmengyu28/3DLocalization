@@ -8,7 +8,6 @@ from torch.utils.data.distributed import DistributedSampler as Disample
 
 
 def dataloader(data_path, labels, params, opt, num_workers=0):
-    # dataset = ImagesDataset(data_path, params['partition'], labels, opt)
     dataset = ImagesDataset_v2(data_path, params['partition'], labels, opt)
 
     batch_size = params['batch_size']
@@ -36,9 +35,14 @@ class ImagesDataset_v2(Dataset):
     def __getitem__(self, index):
         ID = self.list_IDs[index]
 
-        im_name = os.path.join(self.root_dir,'observed','im' + ID + '.mat')
-        im_mat = scipy.io.loadmat(im_name)
-        im_np = np.float32(im_mat['g'])
+        if self.opt.step_mode == 'all' or self.opt.step_mode == '1':
+            im_name = os.path.join(self.root_dir,'observed','im' + ID + '.mat')
+            im_mat = scipy.io.loadmat(im_name)
+            im_np = np.float32(im_mat['g'])
+        elif self.opt.step_mode == '2':
+            im_name = os.path.join(self.root_dir,'denoised_' + self.opt.model_use_denoising, 'denoised_image_' + ID + '.mat')
+            im_mat = scipy.io.loadmat(im_name)
+            im_np = np.float32(im_mat['im'])
 
         # turn image into torch tensor with 1 channel
         im_tensor = torch.from_numpy(im_np).unsqueeze(0) # [1,96,96]

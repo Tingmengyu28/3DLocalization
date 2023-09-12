@@ -120,19 +120,19 @@ class Postprocess(Module):
     def postpro_implement_v2(self, pred_vol):
         xyz_rec, conf_rec, xyz_bool = self.no_postpro_implement(pred_vol)
         group_list = []
-        valid_points = [i for i in range(len(conf_rec)) if conf_rec[i] >= 0.05 * np.max(conf_rec)]
+        valid_points = [i for i in range(len(conf_rec)) if conf_rec[i] >= 0.0 *  np.max(conf_rec)]
         conf_rec_copy = conf_rec.copy()
 
         while not equal_to_zero(conf_rec_copy, valid_points):
             zero_count = 0
-            neighbors = list(BFS(xyz_rec, conf_rec_copy, valid_points, self.r))
+            neighbors = list(BFS(xyz_rec, conf_rec_copy, valid_points, 1))
             for i in neighbors:
                 conf_rec_copy[i] = 0
             group_list.append(neighbors)
             for i in conf_rec_copy:
                 if i == 0:
                     zero_count += 1
-            print(str(zero_count) + '/' + str(len(valid_points)))
+            # print(str(zero_count) + '/' + str(len(valid_points)))
 
         cen_xyz_rec, cen_conf_rec, cen_xyz_bol = [], [], []
         for group in group_list:
@@ -145,7 +145,7 @@ class Postprocess(Module):
             cen_xyz_bol.append(list(centroid(points, mass_list)))
             cen_conf_rec.append(sum(mass_list))
 
-        pro_valid_points = [i for i in range(len(cen_conf_rec)) if cen_conf_rec[i] >= 0.05 * np.max(cen_conf_rec)]
+        pro_valid_points = [i for i in range(len(cen_conf_rec)) if cen_conf_rec[i] >= self.thresh * np.max(cen_conf_rec)]
         cen_xyz_rec_f, cen_conf_rec_f, cen_xyz_bol_f = [], [], []
 
         for p in pro_valid_points:

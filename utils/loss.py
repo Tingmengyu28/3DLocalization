@@ -5,6 +5,7 @@ import numpy as np
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # self-defined modules
 from utils.fft_conv import fft_conv
 
@@ -43,7 +44,7 @@ def regularization_term(pred, a):
 
 
 
-def GaussianKernel(shape=(7, 5, 5), sigma=1, normfactor=1):
+def GaussianKernel(shape=(7, 7, 7), sigma=1, normfactor=1):
     """
     TODO: create a 3D gaussian kernel
     3D gaussian mask - should give the same result as MATLAB's
@@ -84,14 +85,17 @@ class MSE3D(nn.Module):
         pred_bol = pred_bol.unsqueeze(1)
 
         # KDE for both input and ground truth spikes
-        # Din = F.conv3d(pred_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
-        # Dtar = F.conv3d(target_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
-        Din = fft_conv(pred_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
-        Dtar = fft_conv(target_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
+        Din = F.conv3d(pred_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
+        Dtar = F.conv3d(target_bol, self.factor*self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
+
+        # Din = fft_conv(pred_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
+        # Dtar = fft_conv(target_bol, self.kernel, padding=(int(np.round((D - 1) / 2)), 0, 0))
 
         kde_loss = nn.MSELoss()(Din, Dtar)
 
-        return kde_loss
+        final_loss = kde_loss + dice_loss(pred_bol/self.factor, target_bol)
+
+        return final_loss
 
 
 def PSF_matrix():
@@ -129,11 +133,14 @@ class Forward_loss(nn.Module):
         pred = fft_conv(input, self.PSF, padding=(pd_d,pd_h,pd_w),padding_mode='reflect')[:,0,20,:]
         mse_fft = nn.MSELoss()(pred,target)
 
+        kdl = pred - target * torch.log(pred + 5)
+        kdl_loss = torch.sum(kdl)
+
         # pred_conv = F.conv3d(input, self.PSF, padding=(pd_d,pd_h,pd_w))[:,0,20,:]
         # mse_conv = nn.MSELoss()(pred_conv,target)
         # print(f'{mse_fft} {mse_conv}')
 
-        return mse_fft
+        return kdl_loss
 
 
 class Forward_loss_v2(nn.Module):
@@ -189,8 +196,7 @@ class calculate_loss(nn.Module):
         # mse2d = self.forward_loss(normgrid,gt_normgrid)
 
         # final loss
-        # loss = mse3d + mse2d/1e5 + reg
-        loss = mse3d + mse2d/1e5
+        loss = mse3d * 1000 + mse2d * 10 + reg
 
         # record loss this iter and total loss
         if metric is not None:

@@ -5,16 +5,19 @@ import json
 import argparse
 import numpy as np
 import torch
+import pandas as pd
 from torch.optim import Adam
 import torch.optim.lr_scheduler as lr_scheduler
 from lib import radam
 from utils.helper import Logger
+from torchvision.utils import save_image
 import torch.optim as optim
 # self-defined module
-from utils.helper import init_DDP, print_log, load_labels, build_model
+from utils.helper import init_DDP, print_log, load_labels, build_model, get_precision_recall
 from utils.data import dataloader
 from utils.train_model import train_model, train_model_step1
 from utils.test_model import test_model
+from scipy.io import savemat
 
 
 def learn_localization(opt, rank=0, world_size=1):
@@ -38,7 +41,7 @@ def learn_localization(opt, rank=0, world_size=1):
 
         t_simple = 'model_' + time.strftime('%m%d')
 
-        opt.save_path = os.path.join(opt.save_path, 'step' + step_mode, t_simple)
+        opt.save_path = os.path.join(opt.save_path, 'step' + step_mode, opt.model_use_denoising, t_simple)
         os.makedirs(opt.save_path, exist_ok=True)
 
         log = open(os.path.join(opt.save_path, 'log_{}.txt'.format(time.strftime('%H%M'))), 'w')
@@ -77,7 +80,7 @@ def learn_localization(opt, rank=0, world_size=1):
         optimizer = optim.Adam(model.parameters(), lr=opt.initial_learning_rate)
         #### scheduler
         if opt.scheduler == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 30, eta_min=0)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, opt.max_epoch, eta_min=0)
         elif opt.scheduler == 'inv_sqrt':
             # originally used for Transformer (in Attention is all you need)
             def lr_lambda(step):
@@ -89,6 +92,8 @@ def learn_localization(opt, rank=0, world_size=1):
             scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         elif opt.scheduler == 'dev_perf':
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=0, min_lr=0)
+        elif opt.scheduler_type == 'StepLR':
+            scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_per_epoch, gamma=opt.lr_decay_factor)
 
         # Print Model layers and number of parameters
         print_log(model, log)
@@ -96,7 +101,7 @@ def learn_localization(opt, rank=0, world_size=1):
 
         # if resume_training, continue from a checkpoint
         if opt.resume:
-            checkpoint_path = './Data/results/step' + step_mode + opt.checkpoint_path + '/' + opt.checkpoint
+            checkpoint_path = './Data/results/step' + step_mode + '/' + opt.model_use_denoising + opt.checkpoint_path + '/' + opt.checkpoint
             try:
                 checkpoint = torch.load(checkpoint_path)
                 model.load_state_dict(checkpoint['model'])
@@ -104,40 +109,47 @@ def learn_localization(opt, rank=0, world_size=1):
             except:
                 pass
 
-        if opt.step_mode == 'all':
+        if opt.step_mode == 'all' or opt.step_mode == '2':
             train_model(model, optimizer, scheduler, device,
                         training_generator, validation_generator, log, logger, opt)
         elif opt.step_mode == '1':
             train_model_step1(model, optimizer, scheduler, device,
                         training_generator, validation_generator, log, opt)
+            
 
     elif opt.train_or_test == 'test':
-        checkpoint_path = './Data/results/step' + step_mode + opt.checkpoint_path + '/' + opt.checkpoint
+        step_mode = opt.step_mode
+        checkpoint_path = './Data/results/step' + step_mode + '/' + opt.model_use_denoising + opt.checkpoint_path + '/' + opt.checkpoint
         opt.device = 'cuda'
-        if opt.postpro:
-            opt.postpro_params = {'thresh': 0.05, 'radius': 1}
+        if opt.postpro: 
+            opt.postpro_params = {'thresh': 0.05, 'radius': 2}
 
         time_start = time.time()
-        os.makedirs(opt.save_path, 'step' + step_mode, exist_ok=True)
+        os.makedirs(opt.save_path + '/step' + step_mode + '/' + opt.model_use_denoising + '/test_results', exist_ok=True)
         opt.pixel_size_axial = (opt.zeta[1] - opt.zeta[0] + 1 + 2*opt.clear_dist) / opt.D
 
         # model testing
         model = build_model(opt)
-        model.to('cuda')
-        model.load_state_dict(torch.load(checkpoint_path)['model'])
-        model.eval()
+        if opt.model_use == 'deq' or opt.model_use == 'dncnn' or opt.model_use == 'cnn_residual':
+            model.to('cuda')
+            model.load_state_dict(torch.load(checkpoint_path)['model'])
+            model.eval()
+        else:
+            model.to('cuda')
+            model.eval()
 
-        log = open(os.path.join(opt.save_path, 'step' + step_mode, 'test_results', 'log_{}.txt'.format(time.strftime('%H%M'))), 'w')
+        log = open(os.path.join(opt.save_path, 'step' + step_mode, opt.model_use_denoising, 'test_results', 'log_{}.txt'.format(time.strftime('%H%M'))), 'w')
         print_log('setup_params -- test:', log)
         for key, value in opt._get_kwargs():
             if not key == 'partition':
                 print_log('{}: {}'.format(key, value), log)
 
         # save setup parameters in results folder as well
-        with open(os.path.join(opt.save_path, 'step' + step_mode, 'setup_params_test.json'), 'w') as handle:
+        with open(os.path.join(opt.save_path, 'step' + step_mode, opt.model_use_denoising, 'setup_params_test.json'), 'w') as handle:
             json.dump(opt.__dict__, handle, indent=2)
 
         test_model(opt, model, log)
+                
         time_end = time.time()
         print(f'Time cost: {time_end-time_start}')
     else:
@@ -171,18 +183,20 @@ if __name__ == '__main__':
     
     # train info
     parser.add_argument('--model_use',
-                        type=str,           default='deq')
+                        type=str,           default='cnn_residual')
+    parser.add_argument('--model_use_denoising',
+                        type=str,           default='none')
     parser.add_argument('--step_mode',
                         type=str,           default='all')
     parser.add_argument('--postpro',                action='store_true',
                         default=False,       help='whether do post processing in dnn')
-    parser.add_argument('--batch_size',               type=int,           default=8,
+    parser.add_argument('--batch_size',               type=int,           default = 8,
                         help='when training on multi GPU, is the batch size on each GPU')
     parser.add_argument('--initial_learning_rate',    type=float,
                         default=0.0005,      help='initial learning rate for adam')
 
-    parser.add_argument('--optim', default='Adam', type=str,
-                        choices=['Adam', 'SGD', 'Adagrad', 'RMSprop', 'RAdam'],
+    parser.add_argument('--optim', default='StepLR', type=str,
+                        choices=['Adam', 'SGD', 'Adagrad', 'RMSprop', 'RAdam', 'StepLR'],
                         help='optimizer to use.')
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='weight decay')
@@ -197,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_decay_factor',          type=float,
                         default=0.5,         help='lr decay factor')
     parser.add_argument('--max_epoch',                type=int,
-                        default=30,          help='number of training epoches')
+                        default=150,          help='number of training epoches')
     parser.add_argument('--save_epoch',               type=int,
                         default=3,           help='save model per save_epoch')
     parser.add_argument('--f_thres', type = int, 
@@ -209,11 +223,11 @@ if __name__ == '__main__':
     parser.add_argument('--test_id_loc', type=str,
                         default='./Data/id_test.txt')
     parser.add_argument('--checkpoint', type=str,
-                        default='checkpoint_21', help='checkpoint to resume from')
+                        default='checkpoint_69', help='checkpoint to resume from')
     parser.add_argument('--checkpoint_path', type=str,
-                        default='/model_0413')
+                        default='/model_0903')
     parser.add_argument('--data_path', type=str,
-                        default='./Data/train_images', help='path for train and val data')
+                        default='./Data/test_images', help='path for train and val data')
     parser.add_argument('--save_path', type=str, default='./Data/results',
                         help='path for save models and results')
 
@@ -221,4 +235,5 @@ if __name__ == '__main__':
 
     # gpu_number = len(opt.gpu_number.split(','))
     # mp.spawn(learn_localization,args=(gpu_number,opt),nprocs=gpu_number,join=True)
+
     learn_localization(opt)
