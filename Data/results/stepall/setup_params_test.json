@@ -1,0 +1,43 @@
+{
+  "train_or_test": "test",
+  "resume": false,
+  "gpu_number": "1",
+  "H": 96,
+  "W": 96,
+  "zeta": [
+    -20,
+    20
+  ],
+  "clear_dist": 0,
+  "D": 400,
+  "scaling_factor": 800,
+  "upsampling_factor": 4,
+  "model_use": "cnn_residual",
+  "step_mode": "all",
+  "postpro": true,
+  "batch_size": 8,
+  "initial_learning_rate": 0.0005,
+  "optim": "Adam",
+  "weight_decay": 0.0,
+  "scheduler": "cosine",
+  "warmup_step": 0,
+  "lr_decay_per_epoch": 10,
+  "lr_decay_factor": 0.5,
+  "max_epoch": 150,
+  "save_epoch": 3,
+  "f_thres": 500,
+  "b_thres": 800,
+  "test_id_loc": "./Data/id_test.txt",
+  "checkpoint": "checkpoint_27",
+  "checkpoint_path": "/model_0402",
+  "data_path": "./Data/test_images",
+  "save_path": "./Data/results",
+  "rank": 0,
+  "world_size": 1,
+  "device": "cuda",
+  "postpro_params": {
+    "thresh": 0.05,
+    "radius": 2
+  },
+  "pixel_size_axial": 0.1025
+}
